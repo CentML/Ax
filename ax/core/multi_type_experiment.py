@@ -11,7 +11,7 @@ from ax.core.arm import Arm
 from ax.core.base_trial import BaseTrial
 from ax.core.data import Data
 from ax.core.experiment import DataType, Experiment
-from ax.core.metric import Metric
+from ax.core.metric import Metric, MetricFetchResult
 from ax.core.optimization_config import OptimizationConfig
 from ax.core.runner import Runner
 from ax.core.search_space import SearchSpace
@@ -204,7 +204,7 @@ class MultiTypeExperiment(Experiment):
     @copy_doc(Experiment._fetch_trial_data)
     def _fetch_trial_data(
         self, trial_index: int, metrics: Optional[List[Metric]] = None, **kwargs: Any
-    ) -> Data:
+    ) -> Dict[str, MetricFetchResult]:
         trial = self.trials[trial_index]
         metrics = [
             metric

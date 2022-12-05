@@ -70,6 +70,7 @@ DUMMY_RUN_METADATA = {
     "TEST_KEY": "TEST_VALUE",
     "abc": {123: 456},
 }
+ARM_NAME = "test_arm_name"
 
 
 def run_trials_using_recommended_parallelism(
@@ -817,8 +818,13 @@ class TestAxClient(TestCase):
         with self.subTest("objective_names"):
             self.assertEqual(ax_client.objective_names, ["test_objective"])
 
+        with self.subTest("metric_names"):
+            self.assertEqual(
+                ax_client.metric_names,
+                {"test_objective", "some_metric", "test_tracking_metric"},
+            )
+
     def test_create_single_objective_experiment_with_objectives_dict(self) -> None:
-        """Test basic experiment creation."""
         ax_client = AxClient(
             GenerationStrategy(
                 steps=[GenerationStep(model=Models.SOBOL, num_trials=30)]
@@ -945,14 +951,7 @@ class TestAxClient(TestCase):
             )
 
     def test_set_optimization_config_with_metric_definitions(self) -> None:
-        """Test basic experiment creation."""
-        ax_client = AxClient(
-            GenerationStrategy(
-                steps=[GenerationStep(model=Models.SOBOL, num_trials=30)]
-            )
-        )
-        with self.assertRaisesRegex(ValueError, "Experiment not set on Ax client"):
-            ax_client.experiment
+        ax_client = AxClient()
 
         metric_definitions = {
             "obj_m1": {"properties": {"m1_opt": "m1_val"}},
@@ -1005,6 +1004,46 @@ class TestAxClient(TestCase):
             ax_client.metric_definitions["obj_m2"]["properties"],
             metric_definitions["obj_m2"]["properties"],
         )
+
+    def test_add_and_remove_tracking_metrics(self) -> None:
+        ax_client = AxClient()
+
+        metric_definitions = {
+            "tm1": {"properties": {"m1_opt": "m1_val"}},
+        }
+        ax_client.create_experiment(
+            name="test_experiment",
+            parameters=[
+                {
+                    "name": "x",
+                    "type": "range",
+                    "bounds": [0.001, 0.1],
+                },
+            ],
+            is_test=True,
+        )
+        with self.subTest("add tracking metrics with definitions"):
+            ax_client.add_tracking_metrics(
+                # one with a definition, one without
+                metric_names=[
+                    "tm1",
+                    "tm2",
+                ],
+                metric_definitions=metric_definitions,
+            )
+            tracking_metrics = ax_client.experiment.tracking_metrics
+            self.assertEqual(len(tracking_metrics), 2)
+            self.assertEqual(tracking_metrics[0].name, "tm1")
+            self.assertEqual(tracking_metrics[0].properties, {"m1_opt": "m1_val"})
+            self.assertEqual(tracking_metrics[1].name, "tm2")
+            self.assertEqual(tracking_metrics[1].properties, {})
+
+        with self.subTest("remove tracking metric"):
+            ax_client.remove_tracking_metric(metric_name="tm2")
+            tracking_metrics = ax_client.experiment.tracking_metrics
+            self.assertEqual(len(tracking_metrics), 1)
+            self.assertEqual(tracking_metrics[0].name, "tm1")
+            self.assertEqual(tracking_metrics[0].properties, {"m1_opt": "m1_val"})
 
     def test_set_search_space(self) -> None:
         """Test basic experiment creation."""
@@ -1134,40 +1173,18 @@ class TestAxClient(TestCase):
         }
         with self.subTest("objective_name"):
             with self.assertRaises(UnsupportedError):
-                # pyre-fixme[6]: For 2nd param expected `List[Dict[str, Union[None, L...
-                # pyre-fixme[6]: For 2nd param expected `Optional[List[str]]` but got...
-                # pyre-fixme[6]: For 2nd param expected `Optional[Dict[str, typing.An...
-                # pyre-fixme[6]: For 2nd param expected `Optional[Dict[str, Dict[str,...
-                # pyre-fixme[6]: For 2nd param expected `Optional[Dict[str, Union[Non...
-                # pyre-fixme[6]: For 2nd param expected `Optional[Dict[str, Objective...
-                # pyre-fixme[6]: For 2nd param expected `Optional[bool]` but got `Uni...
-                # pyre-fixme[6]: For 2nd param expected `Optional[str]` but got `Unio...
-                # pyre-fixme[6]: For 2nd param expected `bool` but got `Union[List[Un...
+                # pyre-ignore[6]
                 ax_client.create_experiment(objective_name="something", **params)
         with self.subTest("minimize"):
             with self.assertRaises(UnsupportedError):
-                # pyre-fixme[6]: For 2nd param expected `List[Dict[str, Union[None, L...
-                # pyre-fixme[6]: For 2nd param expected `Optional[List[str]]` but got...
-                # pyre-fixme[6]: For 2nd param expected `Optional[Dict[str, typing.An...
-                # pyre-fixme[6]: For 2nd param expected `Optional[Dict[str, Dict[str,...
-                # pyre-fixme[6]: For 2nd param expected `Optional[Dict[str, Union[Non...
-                # pyre-fixme[6]: For 2nd param expected `Optional[Dict[str, Objective...
-                # pyre-fixme[6]: For 2nd param expected `Optional[str]` but got `Unio...
-                # pyre-fixme[6]: For 2nd param expected `bool` but got `Union[List[Un...
+                # pyre-ignore[6]
                 ax_client.create_experiment(minimize=False, **params)
         with self.subTest("both"):
             with self.assertRaises(UnsupportedError):
                 ax_client.create_experiment(
                     objective_name="another thing",
                     minimize=False,
-                    # pyre-fixme[6]: For 3rd param expected `List[Dict[str, Union[Non...
-                    # pyre-fixme[6]: For 3rd param expected `Optional[List[str]]` but...
-                    # pyre-fixme[6]: For 3rd param expected `Optional[Dict[str, typin...
-                    # pyre-fixme[6]: For 3rd param expected `Optional[Dict[str, Dict[...
-                    # pyre-fixme[6]: For 3rd param expected `Optional[Dict[str, Union...
-                    # pyre-fixme[6]: For 3rd param expected `Optional[Dict[str, Objec...
-                    # pyre-fixme[6]: For 3rd param expected `Optional[str]` but got `...
-                    # pyre-fixme[6]: For 3rd param expected `bool` but got `Union[Lis...
+                    # pyre-ignore[6]
                     **params,
                 )
 
@@ -1655,13 +1672,18 @@ class TestAxClient(TestCase):
             minimize=True,
         )
         params, idx = ax_client.attach_trial(
-            parameters={"x": 0.0, "y": 1.0}, run_metadata=DUMMY_RUN_METADATA
+            parameters={"x": 0.0, "y": 1.0},
+            run_metadata=DUMMY_RUN_METADATA,
+            arm_name=ARM_NAME,
         )
         ax_client.complete_trial(trial_index=idx, raw_data=5)
         # pyre-fixme[16]: `Optional` has no attribute `__getitem__`.
         self.assertEqual(ax_client.get_best_parameters()[0], params)
         self.assertEqual(
             ax_client.get_trial_parameters(trial_index=idx), {"x": 0, "y": 1}
+        )
+        self.assertEqual(
+            not_none(ax_client.get_trial(trial_index=idx).arm).name, ARM_NAME
         )
         with self.assertRaises(KeyError):
             ax_client.get_trial_parameters(
@@ -1857,8 +1879,6 @@ class TestAxClient(TestCase):
         # up-to-date experiment data. Do adding trial #4 to the seen completed
         # trials of pre-storage GS to check their equality otherwise.
         gs._seen_trial_indices_by_status[TrialStatus.COMPLETED].add(4)
-        # Resolves _db_id field between these classes
-        _resolve_db_id(ax_client.generation_strategy, gs)
         self.assertEqual(gs, ax_client.generation_strategy)
         with self.assertRaises(ValueError):
             # Overwriting existing experiment.
@@ -2711,17 +2731,6 @@ class TestAxClient(TestCase):
         gpei_step_kwargs = ax_client.generation_strategy._steps[1].model_kwargs
         # pyre-fixme[16]: `Optional` has no attribute `__getitem__`.
         self.assertEqual(gpei_step_kwargs["torch_device"], device)
-
-
-# pyre-fixme[2]: Parameter must be annotated.
-def _resolve_db_id(gs_to_resolve, source_gs) -> None:
-    gs_to_resolve._steps[1].model_kwargs["transform_configs"]["Winsorize"][
-        "optimization_config"
-    ].objective.metric._db_id = (
-        source_gs._steps[1]
-        .model_kwargs["transform_configs"]["Winsorize"]["optimization_config"]
-        .objective.metric._db_id
-    )
 
 
 # Utility functions for testing get_model_predictions without calling

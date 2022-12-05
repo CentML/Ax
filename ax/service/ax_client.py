@@ -435,6 +435,34 @@ class AxClient(WithDBSettingsBase, BestPointMixin, InstantiationBase):
                 "optimization config not set because it was missing objectives"
             )
 
+    def add_tracking_metrics(
+        self,
+        metric_names: List[str],
+        metric_definitions: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
+        """Add a list of new metrics to the experiment.
+
+        If any of the metrics are already defined on the experiment,
+        we raise an error and don't add any of them to the experiment
+
+        Args:
+            metric_names: Names of metrics to be added.
+            metric_definitions: A mapping of metric names to extra kwargs to pass
+                to that metric
+        """
+        self.experiment.add_tracking_metrics(
+            metrics=[
+                self._make_metric(
+                    name=metric_name, metric_definitions=metric_definitions
+                )
+                for metric_name in metric_names
+            ]
+        )
+
+    @copy_doc(Experiment.remove_tracking_metric)
+    def remove_tracking_metric(self, metric_name: str) -> None:
+        self.experiment.remove_tracking_metric(metric_name=metric_name)
+
     def set_search_space(
         self,
         parameters: List[
@@ -509,13 +537,13 @@ class AxClient(WithDBSettingsBase, BestPointMixin, InstantiationBase):
         # Check if the global stopping strategy suggests to stop the optimization.
         # This is needed only if there is actually a stopping strategy specified,
         # and if this function is not forced to generate a new trial.
-        if self._global_stopping_strategy and (not force):
-            # The strategy itslef will check if enough trials have already been
+        if self.global_stopping_strategy and (not force):
+            # The strategy itself will check if enough trials have already been
             # completed.
             (
                 stop_optimization,
                 global_stopping_message,
-            ) = self._global_stopping_strategy.should_stop_optimization(
+            ) = self.global_stopping_strategy.should_stop_optimization(
                 experiment=self.experiment
             )
             if stop_optimization:
@@ -823,6 +851,7 @@ class AxClient(WithDBSettingsBase, BestPointMixin, InstantiationBase):
         parameters: TParameterization,
         ttl_seconds: Optional[int] = None,
         run_metadata: Optional[Dict[str, Any]] = None,
+        arm_name: Optional[str] = None,
     ) -> Tuple[TParameterization, int]:
         """Attach a new trial with the given parameterization to the experiment.
 
@@ -852,7 +881,8 @@ class AxClient(WithDBSettingsBase, BestPointMixin, InstantiationBase):
             ).metadata
 
         trial = self.experiment.new_trial(ttl_seconds=ttl_seconds).add_arm(
-            Arm(parameters=parameters), candidate_metadata=candidate_metadata
+            Arm(parameters=parameters, name=arm_name),
+            candidate_metadata=candidate_metadata,
         )
         trial.mark_running(no_runner_required=True)
         logger.info(
@@ -1462,6 +1492,21 @@ class AxClient(WithDBSettingsBase, BestPointMixin, InstantiationBase):
             for m in self.experiment.metrics.values()
         }
 
+    @property
+    def metric_names(self) -> Set[str]:
+        """Returns the names of all metrics on the attached experiment."""
+        return set(self.experiment.metrics)
+
+    @property
+    def global_stopping_strategy(self) -> Optional[BaseGlobalStoppingStrategy]:
+        """The global stopping strategy used on the experiment."""
+        return self._global_stopping_strategy
+
+    @global_stopping_strategy.setter
+    def global_stopping_strategy(self, gss: BaseGlobalStoppingStrategy) -> None:
+        """Update the global stopping strategy."""
+        self._global_stopping_strategy = gss
+
     @copy_doc(BestPointMixin.get_best_trial)
     def get_best_trial(
         self,
@@ -1750,7 +1795,7 @@ class AxClient(WithDBSettingsBase, BestPointMixin, InstantiationBase):
 
         evaluations, data = self.data_and_evaluations_from_raw_data(
             raw_data=raw_data_by_arm,
-            metric_names=self.objective_names,
+            metric_names=list(self.metric_names),
             trial_index=trial.index,
             sample_sizes=sample_sizes or {},
             start_time=(

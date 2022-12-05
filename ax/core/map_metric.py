@@ -9,7 +9,10 @@ from __future__ import annotations
 from typing import Type
 
 from ax.core.map_data import MapData
-from ax.core.metric import Metric
+from ax.core.metric import Metric, MetricFetchE
+from ax.utils.common.result import Result
+
+MapMetricFetchResult = Result[MapData, MetricFetchE]
 
 
 class MapMetric(Metric):

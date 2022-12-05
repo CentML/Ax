@@ -253,7 +253,7 @@ def _get_acquisition_func(
     # construct Objective module
     if kwargs.get("chebyshev_scalarization", False):
         with torch.no_grad():
-            Y = model.posterior(X_observed).mean
+            Y = model.posterior(X_observed).mean  # pyre-ignore [16]
         obj_tf = get_chebyshev_scalarization(weights=objective_weights, Y=Y)
     else:
         obj_tf = get_objective_weights_transform(objective_weights)
@@ -341,6 +341,10 @@ def scipy_optimizer(
         sequential = False
     else:
         sequential = True
+    if "init_batch_limit" not in kwargs:
+        kwargs["init_batch_limit"] = 32
+    if "batch_limit" not in kwargs:
+        kwargs["batch_limit"] = 5
     X, expected_acquisition_value = optimize_acqf(
         acq_function=acq_function,
         bounds=bounds,

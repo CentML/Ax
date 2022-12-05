@@ -6,8 +6,12 @@
 
 import warnings
 from copy import deepcopy
+from typing import Dict, Optional, Tuple
+from unittest import mock
 
 import numpy as np
+from ax.core.data import Data
+from ax.core.experiment import Experiment
 from ax.core.metric import Metric
 from ax.core.objective import MultiObjective, Objective, ScalarizedObjective
 from ax.core.observation import Observation, ObservationData, ObservationFeatures
@@ -21,18 +25,34 @@ from ax.core.outcome_constraint import (
     OutcomeConstraint,
     ScalarizedOutcomeConstraint,
 )
+from ax.core.parameter import ParameterType, RangeParameter
+from ax.core.search_space import SearchSpace
 from ax.exceptions.core import DataRequiredError, UnsupportedError, UserInputError
+from ax.modelbridge.base import ModelBridge
 from ax.modelbridge.transforms.winsorize import (
     _get_auto_winsorization_cutoffs_outcome_constraint,
     _get_auto_winsorization_cutoffs_single_objective,
     _get_tukey_cutoffs,
     AUTO_WINS_QUANTILE,
-    WinsorizationConfig,
     Winsorize,
 )
+from ax.models.winsorization_config import WinsorizationConfig
 from ax.utils.common.testutils import TestCase
 from ax.utils.testing.core_stubs import get_optimization_config
 from typing_extensions import SupportsIndex
+
+
+OBSERVATION_DATA = [
+    Observation(
+        features=ObservationFeatures(parameters={"x": 2.0, "y": 10.0}),
+        data=ObservationData(
+            means=np.array([1.0, 2.0, 6.0]),
+            covariance=np.array([[1.0, 2.0, 0.0], [3.0, 4.0, 0.0], [0.0, 0.0, 4.0]]),
+            metric_names=["a", "b", "b"],
+        ),
+        arm_name="1_1",
+    )
+]
 
 
 class WinsorizeTransformTest(TestCase):
@@ -61,21 +81,21 @@ class WinsorizeTransformTest(TestCase):
         self.t = Winsorize(
             search_space=None,
             observations=deepcopy(self.observations),
-            config={  # pyre-ignore
+            config={
                 "winsorization_config": WinsorizationConfig(upper_quantile_margin=0.2)
             },
         )
         self.t1 = Winsorize(
             search_space=None,
             observations=deepcopy(self.observations),
-            config={  # pyre-ignore
+            config={
                 "winsorization_config": WinsorizationConfig(upper_quantile_margin=0.8)
             },
         )
         self.t2 = Winsorize(
             search_space=None,
             observations=deepcopy(self.observations),
-            config={  # pyre-ignore
+            config={
                 "winsorization_config": WinsorizationConfig(lower_quantile_margin=0.2)
             },
         )
@@ -133,6 +153,21 @@ class WinsorizeTransformTest(TestCase):
             },
         )
 
+    def testPrintDeprecationWarning(self) -> None:
+        warnings.simplefilter("always", DeprecationWarning)
+        with warnings.catch_warnings(record=True) as ws:
+            Winsorize(
+                search_space=None,
+                observations=deepcopy(self.observations),
+                config={"optimization_config": "dummy_val"},
+            )
+            self.assertTrue(
+                "Winsorization received an out-of-date `transform_config`, containing "
+                'the key `"optimization_config"`. Please update the config according '
+                "to the docs of `ax.modelbridge.transforms.winsorize.Winsorize`."
+                in [str(w.message) for w in ws]
+            )
+
     def testInit(self) -> None:
         self.assertEqual(self.t.cutoffs["m1"], (-float("inf"), 2.0))
         self.assertEqual(self.t.cutoffs["m2"], (-float("inf"), 2.0))
@@ -156,13 +191,12 @@ class WinsorizeTransformTest(TestCase):
             )
         with self.assertRaisesRegex(
             UserInputError,
-            "Expected `optimization_config` of type `OptimizationConfig` "
-            "but got type `<class 'int'>.",
+            "`derelativize_with_raw_status_quo` must be a boolean. Got 1234.",
         ):
             Winsorize(
                 search_space=None,
                 observations=deepcopy(self.observations[:1]),
-                config={"optimization_config": 1234},
+                config={"derelativize_with_raw_status_quo": 1234},
             )
 
     def testTransformObservations(self) -> None:
@@ -236,14 +270,6 @@ class WinsorizeTransformTest(TestCase):
             winsorization_config={"m1": WinsorizationConfig(0.2, 0.0)},
         )
         self.assertDictEqual(percentiles, {"m1": (1, float("inf"))})
-
-        # Don't winsorize if optimization_config is mistyped
-        optimization_config = "not an optimization config"
-        with self.assertRaisesRegex(
-            UserInputError,
-            "Expected `optimization_config` of type `OptimizationConfig`",
-        ):
-            get_default_transform_cutoffs(optimization_config=optimization_config)
 
     def test_tukey_cutoffs(self) -> None:
         Y = np.array([-100, 0, 1, 2, 50])
@@ -390,15 +416,14 @@ class WinsorizeTransformTest(TestCase):
         m2 = Metric(name="m2", lower_is_better=True)
         m3 = Metric(name="m3")
         # Scalarized objective shouldn't be winsorized but should print a warning
-        config = {
-            "optimization_config": OptimizationConfig(
-                objective=ScalarizedObjective(metrics=[m1, m2])
-            )
-        }
+        optimization_config = OptimizationConfig(
+            objective=ScalarizedObjective(metrics=[m1, m2])
+        )
         warnings.simplefilter("always", append=True)
         with warnings.catch_warnings(record=True) as ws:
             transform = get_transform(
-                observation_data=deepcopy(all_obsd), config=config
+                observation_data=deepcopy(all_obsd),
+                optimization_config=optimization_config,
             )
             for i in range(2):
                 print([w.message for w in ws])
@@ -411,8 +436,10 @@ class WinsorizeTransformTest(TestCase):
         self.assertEqual(transform.cutoffs["m2"], (-float("inf"), float("inf")))
         self.assertEqual(transform.cutoffs["m3"], (-float("inf"), float("inf")))
         # Simple single-objective problem
-        config["optimization_config"].objective = Objective(metric=m2, minimize=True)
-        transform = get_transform(observation_data=deepcopy(all_obsd), config=config)
+        optimization_config.objective = Objective(metric=m2, minimize=True)
+        transform = get_transform(
+            observation_data=deepcopy(all_obsd), optimization_config=optimization_config
+        )
         self.assertEqual(transform.cutoffs["m1"], (-float("inf"), float("inf")))
         self.assertEqual(transform.cutoffs["m2"], (-float("inf"), 10.0))  # 4 + 1.5 * 4
         self.assertEqual(transform.cutoffs["m3"], (-float("inf"), float("inf")))
@@ -420,32 +447,38 @@ class WinsorizeTransformTest(TestCase):
         outcome_constraint = OutcomeConstraint(
             metric=m1, op=ComparisonOp.LEQ, bound=3, relative=True
         )
-        config = {
-            "optimization_config": OptimizationConfig(
-                objective=Objective(metric=m2, minimize=True),
-                outcome_constraints=[outcome_constraint],
-            )
-        }
+        optimization_config = OptimizationConfig(
+            objective=Objective(metric=m2, minimize=True),
+            outcome_constraints=[outcome_constraint],
+        )
         with self.assertRaisesRegex(
             UnsupportedError,
-            "Automatic winsorization doesn't support relative outcome constraints. "
-            "Make sure a `Derelativize` transform is applied first.",
+            "Automatic winsorization doesn't support relative outcome constraints "
+            "or objective thresholds when `derelativize_with_raw_status_quo` is not "
+            "set to `True`.",
         ):
-            get_transform(observation_data=deepcopy(all_obsd), config=config)
+            get_transform(
+                observation_data=deepcopy(all_obsd),
+                optimization_config=optimization_config,
+            )
         # Make the constraint absolute, which should trigger winsorization
-        config["optimization_config"].outcome_constraints[0].relative = False
-        transform = get_transform(observation_data=deepcopy(all_obsd), config=config)
+        optimization_config.outcome_constraints[0].relative = False
+        transform = get_transform(
+            observation_data=deepcopy(all_obsd), optimization_config=optimization_config
+        )
         self.assertEqual(transform.cutoffs["m1"], (-float("inf"), 13.5))  # 6 + 1.5 * 5
         self.assertEqual(transform.cutoffs["m2"], (-float("inf"), 10.0))  # 4 + 1.5 * 4
         self.assertEqual(transform.cutoffs["m3"], (-float("inf"), float("inf")))
         # Change to a GEQ constraint
-        config["optimization_config"].outcome_constraints[0].op = ComparisonOp.GEQ
-        transform = get_transform(observation_data=deepcopy(all_obsd), config=config)
+        optimization_config.outcome_constraints[0].op = ComparisonOp.GEQ
+        transform = get_transform(
+            observation_data=deepcopy(all_obsd), optimization_config=optimization_config
+        )
         self.assertEqual(transform.cutoffs["m1"], (-6.5, float("inf")))  # 1 - 1.5 * 5
         self.assertEqual(transform.cutoffs["m2"], (-float("inf"), 10.0))  # 4 + 1.5 * 4
         self.assertEqual(transform.cutoffs["m3"], (-float("inf"), float("inf")))
         # Add a scalarized outcome constraint which should print a warning
-        config["optimization_config"].outcome_constraints = [
+        optimization_config.outcome_constraints = [
             ScalarizedOutcomeConstraint(
                 metrics=[m1, m3], op=ComparisonOp.GEQ, bound=3, relative=False
             )
@@ -453,20 +486,8 @@ class WinsorizeTransformTest(TestCase):
         warnings.simplefilter("always", append=True)
         with warnings.catch_warnings(record=True) as ws:
             transform = get_transform(
-                observation_data=deepcopy(all_obsd), config=config
-            )
-            for i in range(2):
-                self.assertTrue(
-                    "Automatic winsorization isn't supported for a "
-                    "`ScalarizedOutcomeConstraint`. Specify the winsorization settings "
-                    f"manually if you want to winsorize metric m{['1', '3'][i]}."
-                    in [str(w.message) for w in ws]
-                )
-        # Making the constraint relative should print the same warning
-        config["optimization_config"].outcome_constraints[0].relative = True
-        with warnings.catch_warnings(record=True) as ws:
-            transform = get_transform(
-                observation_data=deepcopy(all_obsd), config=config
+                observation_data=deepcopy(all_obsd),
+                optimization_config=optimization_config,
             )
             for i in range(2):
                 self.assertTrue(
@@ -479,15 +500,12 @@ class WinsorizeTransformTest(TestCase):
         moo_objective = MultiObjective(
             [Objective(m1, minimize=False), Objective(m2, minimize=True)]
         )
-        moo_config = {
-            "optimization_config": MultiObjectiveOptimizationConfig(
-                objective=moo_objective
-            )
-        }
+        optimization_config = MultiObjectiveOptimizationConfig(objective=moo_objective)
         warnings.simplefilter("always", append=True)
         with warnings.catch_warnings(record=True) as ws:
             transform = get_transform(
-                observation_data=deepcopy(all_obsd), config=moo_config
+                observation_data=deepcopy(all_obsd),
+                optimization_config=optimization_config,
             )
             for i in range(2):
                 self.assertTrue(
@@ -504,46 +522,139 @@ class WinsorizeTransformTest(TestCase):
             ObjectiveThreshold(m1, 3, relative=True),
             ObjectiveThreshold(m2, 4, relative=True),
         ]
-        moo_config = {
-            "optimization_config": MultiObjectiveOptimizationConfig(
-                objective=moo_objective,
-                objective_thresholds=objective_thresholds,
-                outcome_constraints=[],
-            )
-        }
+        optimization_config = MultiObjectiveOptimizationConfig(
+            objective=moo_objective,
+            objective_thresholds=objective_thresholds,
+            outcome_constraints=[],
+        )
         with self.assertRaisesRegex(
             UnsupportedError,
-            "Automatic winsorization doesn't support relative objective thresholds. "
-            "Make sure a `Derelevatize` transform is applied first.",
+            "Automatic winsorization doesn't support relative outcome constraints or "
+            "objective thresholds when `derelativize_with_raw_status_quo` is not set "
+            "to `True`.",
         ):
-            get_transform(observation_data=deepcopy(all_obsd), config=moo_config)
+            get_transform(
+                observation_data=deepcopy(all_obsd),
+                optimization_config=optimization_config,
+            )
         # Make the objective thresholds absolute (should trigger winsorization)
-        moo_config["optimization_config"].objective_thresholds[0].relative = False
-        moo_config["optimization_config"].objective_thresholds[1].relative = False
+        optimization_config.objective_thresholds[0].relative = False
+        optimization_config.objective_thresholds[1].relative = False
         transform = get_transform(
-            observation_data=deepcopy(all_obsd), config=moo_config
+            observation_data=deepcopy(all_obsd), optimization_config=optimization_config
         )
         self.assertEqual(transform.cutoffs["m1"], (-6.5, float("inf")))  # 1 - 1.5 * 5
         self.assertEqual(transform.cutoffs["m2"], (-float("inf"), 10.0))  # 4 + 1.5 * 4
         self.assertEqual(transform.cutoffs["m3"], (-float("inf"), float("inf")))
         # Add an absolute outcome constraint
-        moo_config["optimization_config"].outcome_constraints = [
+        optimization_config.outcome_constraints = [
             OutcomeConstraint(metric=m3, op=ComparisonOp.GEQ, bound=3, relative=False)
         ]
         transform = get_transform(
-            observation_data=deepcopy(all_obsd), config=moo_config
+            observation_data=deepcopy(all_obsd), optimization_config=optimization_config
         )
         self.assertEqual(transform.cutoffs["m1"], (-6.5, float("inf")))  # 1 - 1.5 * 5
         self.assertEqual(transform.cutoffs["m2"], (-float("inf"), 10.0))  # 4 + 1.5 * 4
         self.assertEqual(transform.cutoffs["m3"], (-3.5, float("inf")))  # 1 - 1.5 * 3
 
+    @mock.patch(
+        "ax.modelbridge.base.observations_from_data",
+        autospec=True,
+        return_value=(OBSERVATION_DATA),
+    )
+    def test_relative_constraints(
+        self,
+        mock_observations_from_data: mock.Mock,
+    ) -> None:
+
+        # ModelBridge with in-design status quo
+        search_space = SearchSpace(
+            parameters=[
+                RangeParameter("x", ParameterType.FLOAT, 0, 20),
+                RangeParameter("y", ParameterType.FLOAT, 0, 20),
+            ]
+        )
+        objective = Objective(Metric("c"))
+
+        # Test with relative constraint, in-design status quo
+        oc = OptimizationConfig(
+            objective=objective,
+            outcome_constraints=[
+                OutcomeConstraint(
+                    Metric("a"), ComparisonOp.LEQ, bound=2, relative=False
+                ),
+                OutcomeConstraint(
+                    Metric("b"), ComparisonOp.LEQ, bound=-10, relative=True
+                ),
+                ScalarizedOutcomeConstraint(
+                    metrics=[Metric("a"), Metric("b")],
+                    weights=[0.0, 1.0],
+                    op=ComparisonOp.LEQ,
+                    bound=-10,
+                    relative=True,
+                ),
+            ],
+        )
+        modelbridge = ModelBridge(
+            search_space=search_space,
+            model=None,
+            transforms=[],
+            experiment=Experiment(search_space, "test"),
+            data=Data(),
+            optimization_config=oc,
+        )
+        with self.assertRaisesRegex(ValueError, "model was not fit with status quo"):
+            Winsorize(
+                search_space=search_space,
+                observations=OBSERVATION_DATA,
+                modelbridge=modelbridge,
+                config={"derelativize_with_raw_status_quo": True},
+            )
+
+        modelbridge = ModelBridge(
+            search_space=search_space,
+            model=None,
+            transforms=[],
+            experiment=Experiment(search_space, "test"),
+            data=Data(),
+            status_quo_name="1_1",
+            optimization_config=oc,
+        )
+        with self.assertRaisesRegex(
+            UnsupportedError, "`derelativize_with_raw_status_quo` is not set to `True`"
+        ):
+            Winsorize(
+                search_space=search_space,
+                observations=OBSERVATION_DATA,
+                modelbridge=modelbridge,
+            )
+        t = Winsorize(
+            search_space=search_space,
+            observations=OBSERVATION_DATA,
+            modelbridge=modelbridge,
+            config={"derelativize_with_raw_status_quo": True},
+        )
+        self.assertDictEqual(
+            t.cutoffs, {"a": (-float("inf"), 3.5), "b": (-float("inf"), 12.0)}
+        )
+
 
 # pyre-fixme[2]: Parameter must be annotated.
-def get_transform(observation_data, config) -> Winsorize:
+def get_transform(observation_data, config=None, optimization_config=None) -> Winsorize:
     observations = [
         Observation(features=ObservationFeatures({}), data=obsd)
         for obsd in observation_data
     ]
+    if optimization_config is not None:
+        modelbridge = _wrap_optimization_config_in_modelbridge(
+            optimization_config=optimization_config
+        )
+        return Winsorize(
+            search_space=None,
+            observations=observations,
+            config=config,
+            modelbridge=modelbridge,
+        )
     return Winsorize(
         search_space=None,
         observations=observations,
@@ -551,26 +662,34 @@ def get_transform(observation_data, config) -> Winsorize:
     )
 
 
-# pyre-fixme[3]: Return type must be annotated.
 def get_default_transform_cutoffs(
-    # pyre-fixme[2]: Parameter must be annotated.
-    optimization_config,
-    # pyre-fixme[2]: Parameter must be annotated.
-    winsorization_config=None,
+    optimization_config: OptimizationConfig,
+    winsorization_config: Optional[Dict[str, WinsorizationConfig]] = None,
     obs_data_len: SupportsIndex = 6,
-):
+) -> Dict[str, Tuple[float, float]]:
     obsd = ObservationData(
         metric_names=["m1"] * obs_data_len,
         means=np.array(range(obs_data_len)),
         covariance=np.eye(obs_data_len),
     )
     obs = Observation(features=ObservationFeatures({}), data=obsd)
+    modelbridge = _wrap_optimization_config_in_modelbridge(optimization_config)
     transform = Winsorize(
         search_space=None,
         observations=[deepcopy(obs)],
+        modelbridge=modelbridge,
         config={
-            "optimization_config": optimization_config,
             "winsorization_config": winsorization_config,
         },
     )
     return transform.cutoffs
+
+
+def _wrap_optimization_config_in_modelbridge(
+    optimization_config: OptimizationConfig,
+) -> ModelBridge:
+    return ModelBridge(
+        search_space=SearchSpace(parameters=[]),
+        model=1,
+        optimization_config=optimization_config,
+    )

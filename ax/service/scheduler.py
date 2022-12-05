@@ -30,7 +30,7 @@ import ax.service.utils.early_stopping as early_stopping_utils
 from ax.core.base_trial import BaseTrial, TrialStatus
 from ax.core.experiment import Experiment
 from ax.core.generator_run import GeneratorRun
-from ax.core.metric import Metric
+from ax.core.metric import Metric, MetricFetchE, MetricFetchResult
 from ax.core.observation import ObservationFeatures
 from ax.core.optimization_config import (
     MultiObjectiveOptimizationConfig,
@@ -170,6 +170,9 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
     # Number of trials that existed on the scheduler's experiment before
     # the scheduler instantiation with that experiment.
     _num_preexisting_trials: int
+    # Number of trials that have been marked either FAILED or ABANDONED due to
+    # MetricFetchE being encountered during _fetch_and_process_trials_data_results
+    _num_trials_bad_due_to_err: int = 0
     # Timestamp of last optimization start time (milliseconds since Unix epoch);
     # recorded in each `run_n_trials`.
     _latest_optimization_start_timestamp: Optional[int] = None
@@ -467,11 +470,16 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
             use_model_predictions=use_model_predictions,
         )
 
-    def report_results(self) -> Dict[str, Any]:
+    def report_results(self, force_refit: bool = False) -> Dict[str, Any]:
         """Optional user-defined function for reporting intermediate
         and final optimization results (e.g. make some API call, write to some
         other db). This function is called whenever new results are available during
         the optimization.
+
+        Args:
+            force_refit: Whether to force the implementation of this method to
+                refit the model on generation strategy before using it to produce
+                results to report (e.g. if using model to visualize data).
 
         Returns:
             An optional dictionary with any relevant data about optimization.
@@ -565,6 +573,7 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
     def wait_for_completed_trials_and_report_results(
         self,
         idle_callback: Optional[Callable[[Scheduler], None]] = None,
+        force_refit: bool = False,
     ) -> Dict[str, Any]:
         """Continuously poll for successful trials, with limited exponential
         backoff, and process the results. Stop once at least one successful
@@ -583,6 +592,7 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
                 in place. `ax.service.utils.report_utils.get_figure_and_callback` is a
                 helper function for generating a callback that will update a Plotly
                 figure.
+            force_refit: Whether to force a refit of the model during report_results.
 
         Returns:
             Results of the optimization so far, represented as a
@@ -646,7 +656,7 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
 
         if idle_callback is not None:
             idle_callback(self)
-        return self.report_results()
+        return self.report_results(force_refit=force_refit)
 
     def should_consider_optimization_complete(self) -> Tuple[bool, str]:
         """Whether this scheduler should consider this optimization complete and not
@@ -688,6 +698,8 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
     def error_if_failure_rate_exceeded(self, force_check: bool = False) -> None:
         """Checks if the failure rate (set in scheduler options) has been exceeded.
 
+        NOTE: Both FAILED and ABANDONED trial statuses count towards the failure rate.
+
         Args:
             force_check: Indicates whether to force a failure-rate check
                 regardless of the number of trials that have been executed. If False
@@ -695,22 +707,24 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
                 five failed trials. If True, the check will be performed unless there
                 are 0 failures.
         """
-        failed_idcs = self.experiment.trial_indices_by_status[TrialStatus.FAILED]
+        bad_idcs = (
+            self.experiment.trial_indices_by_status[TrialStatus.FAILED]
+            | self.experiment.trial_indices_by_status[TrialStatus.ABANDONED]
+        )
         # We only count failed trials with indices that came after the preexisting
         # trials on experiment before scheduler use.
-        num_failed_in_scheduler = sum(
-            1 for f in failed_idcs if f >= self._num_preexisting_trials
+        num_bad_in_scheduler = sum(
+            1 for f in bad_idcs if f >= self._num_preexisting_trials
         )
 
         # skip check if 0 failures
-        if num_failed_in_scheduler == 0:
+        if num_bad_in_scheduler == 0:
             return
 
         # skip check if fewer than min_failed_trials_for_failure_rate_check failures
         # unless force_check is True
         if (
-            num_failed_in_scheduler
-            < self.options.min_failed_trials_for_failure_rate_check
+            num_bad_in_scheduler < self.options.min_failed_trials_for_failure_rate_check
             and not force_check
         ):
             return
@@ -720,14 +734,22 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
         )
 
         failure_rate_exceeded = (
-            num_failed_in_scheduler / num_ran_in_scheduler
+            num_bad_in_scheduler / num_ran_in_scheduler
         ) > self.options.tolerated_trial_failure_rate
 
         if failure_rate_exceeded:
+            if self._num_trials_bad_due_to_err > num_bad_in_scheduler / 2:
+                self.logger.warn(
+                    "MetricFetchE INFO: Sweep aborted due to an exceeded error rate, "
+                    "which was primarily caused by failure to fetch metrics. Please "
+                    "check if anything could cause your metrics to be flakey or "
+                    "broken."
+                )
+
             raise FailureRateExceededError(
                 FAILURE_EXCEEDED_MSG.format(
                     f_rate=self.options.tolerated_trial_failure_rate,
-                    n_failed=num_failed_in_scheduler,
+                    n_failed=num_bad_in_scheduler,
                     n_ran=num_ran_in_scheduler,
                     min_failed=self.options.min_failed_trials_for_failure_rate_check,
                 )
@@ -844,7 +866,9 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
                 yield self._abort_optimization(num_preexisting_trials=n_existing)
                 return
 
-            yield self.wait_for_completed_trials_and_report_results(idle_callback)
+            yield self.wait_for_completed_trials_and_report_results(
+                idle_callback, force_refit=True
+            )
 
         yield self._complete_optimization(
             num_preexisting_trials=n_existing, idle_callback=idle_callback
@@ -1118,7 +1142,7 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
                 f"Fetching data for trials: {idcs} because some metrics "
                 "on experiment are available while trials are running."
             )
-            self._fetch_trials_data(
+            self._fetch_and_process_trials_data_results(
                 trial_indices=running_trial_indices,
                 overwrite_existing_data=True,
             )
@@ -1159,12 +1183,7 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
             # 6. Fetch data for newly completed trials
             if status.is_completed:
                 newly_completed = trial_idcs - prev_completed_trial_idcs
-                # Fetch the data for newly completed trials; this will cache the data
-                # for all metrics. By pre-caching the data now, we remove the need to
-                # fetch it during candidate generation.
-                idcs = make_indices_str(indices=newly_completed)
-                self.logger.info(f"Fetching data for trials: {idcs}.")
-                self._fetch_trials_data(trial_indices=newly_completed)
+                self._process_completed_trials(newly_completed=newly_completed)
 
             updated_trials.extend(trials)
 
@@ -1177,6 +1196,14 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
             trials=updated_trials,
         )
         return updated_any_trial
+
+    def _process_completed_trials(self, newly_completed: Set[int]) -> None:
+        # Fetch the data for newly completed trials; this will cache the data
+        # for all metrics. By pre-caching the data now, we remove the need to
+        # fetch it during candidate generation.
+        idcs = make_indices_str(indices=newly_completed)
+        self.logger.info(f"Fetching data for trials: {idcs}.")
+        self._fetch_and_process_trials_data_results(trial_indices=newly_completed)
 
     def should_stop_trials_early(
         self, trial_indices: Set[int]
@@ -1205,7 +1232,7 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
             num_preexisting_trials=num_preexisting_trials,
             status=RunTrialsStatus.ABORTED,
         )
-        return self.report_results()
+        return self.report_results(force_refit=True)
 
     def _complete_optimization(
         self,
@@ -1218,7 +1245,7 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
         """
         self._record_optimization_complete_message()
         res = self.wait_for_completed_trials_and_report_results(
-            idle_callback=idle_callback
+            idle_callback=idle_callback, force_refit=True
         )
         # Raise an error if the failure rate exceeds tolerance at the
         # end of the optimization.
@@ -1599,3 +1626,81 @@ class Scheduler(WithDBSettingsBase, BestPointMixin):
         self.experiment.fetch_trials_data(
             trial_indices=trial_indices, overwrite_existing_data=overwrite_existing_data
         )
+
+    def _fetch_and_process_trials_data_results(
+        self, trial_indices: Iterable[int], overwrite_existing_data: bool = False
+    ) -> Dict[int, Dict[str, MetricFetchResult]]:
+        """
+        Fetches results from experiment and modifies trial statuses depending on
+        success or failure.
+        """
+
+        results = self.experiment.fetch_trials_data_results(
+            trial_indices=trial_indices, overwrite_existing_data=overwrite_existing_data
+        )
+
+        for trial_index, results_by_metric_name in results.items():
+            for metric_name, result in results_by_metric_name.items():
+                # If the fetch call succeded continue.
+                if result.is_ok():
+                    continue
+
+                metric_fetch_e = result.unwrap_err()
+
+                # Log the Err so the user is aware that something has failed, even if
+                # we do not do anything
+                self.logger.warning(
+                    f"Failed to fetch {metric_name} for trial {trial_index}, found "
+                    f"{metric_fetch_e}."
+                )
+
+                # If the metric is available while running just continue (we can try
+                # again later).
+                metric = self.experiment.metrics[metric_name]
+                status = self.experiment.trials[trial_index].status
+                if (
+                    metric.is_available_while_running()
+                    and status == TrialStatus.RUNNING
+                ):
+                    self.logger.info(
+                        f"MetricFetchE INFO: Because {metric_name} is "
+                        f"available_while_running and trial {trial_index} is still "
+                        "RUNNING continuing the experiment and retrying on next "
+                        "poll..."
+                    )
+                    continue
+
+                # If the fetch failure was for a metric in the optimization config (an
+                # objective or constraint) the trial as failed
+                optimization_config = self.experiment.optimization_config
+                if (
+                    optimization_config is not None
+                    and metric_name in optimization_config.metrics.keys()
+                ):
+                    status = self._mark_err_trial_status(
+                        trial=self.experiment.trials[trial_index],
+                        metric_name=metric_name,
+                        metric_fetch_e=metric_fetch_e,
+                    )
+                    self.logger.warning(
+                        f"MetricFetchE INFO: Because {metric_name} is an objective, "
+                        f"marking trial {trial_index} as {status}."
+                    )
+                    self._num_trials_bad_due_to_err += 1
+                    continue
+
+                self.logger.info(
+                    "MetricFetchE INFO: Continuing optimization even though "
+                    "MetricFetchE encountered."
+                )
+                continue
+
+        return results
+
+    def _mark_err_trial_status(
+        self,
+        trial: BaseTrial,
+        metric_name: Optional[str] = None,
+        metric_fetch_e: Optional[MetricFetchE] = None,
+    ) -> None:
+        trial.mark_failed(unsafe=True)

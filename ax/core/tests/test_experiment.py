@@ -20,6 +20,7 @@ from ax.core.parameter import FixedParameter, ParameterType
 from ax.core.search_space import SearchSpace
 from ax.exceptions.core import UnsupportedError
 from ax.metrics.branin import BraninMetric
+from ax.modelbridge.registry import Models
 from ax.runners.synthetic import SyntheticRunner
 from ax.service.ax_client import AxClient
 from ax.utils.common.constants import EXPERIMENT_IS_TEST_WARNING, Keys
@@ -395,7 +396,9 @@ class ExperimentTest(TestCase):
         self.assertEqual(len(batch_data.df), n)
 
         exp_data = exp.fetch_data()
-        exp_data2 = exp.metrics["b"].fetch_experiment_data(exp)
+        exp_data2 = Metric._unwrap_experiment_data(
+            results=exp.metrics["b"].fetch_experiment_data(exp)
+        )
         self.assertEqual(len(exp_data2.df), 4 * n)
         self.assertEqual(len(exp_data.df), 4 * n)
         self.assertEqual(len(exp.arms_by_name), 4 * n)
@@ -936,6 +939,22 @@ class ExperimentWithMapDataTest(TestCase):
         actual_data = self.experiment.lookup_data()
         self.assertEqual(expected_data, actual_data)
 
+    def testFetchDataWithMixedData(self) -> None:
+        with patch(
+            f"{BraninMetric.__module__}.BraninMetric.is_available_while_running",
+            return_value=False,
+        ):
+            exp = self._setupBraninExperiment(n=5)
+            [exp.trials[i].mark_completed() for i in range(len(exp.trials))]
+
+            # Fill cache with MapData
+            map_data = exp.fetch_data(metrics=[exp.metrics["branin_map"]])
+
+            # Fetch other metrics and merge Data into the cached MapData
+            full_data = exp.fetch_data()
+
+            self.assertEqual(len(full_data.true_df), len(map_data.true_df) + 20)
+
     def testFetchTrialsData(self) -> None:
         exp = self._setupBraninExperiment(n=5)
         batch_0 = exp.trials[0]
@@ -1033,6 +1052,9 @@ class ExperimentWithMapDataTest(TestCase):
             )
             self.assertRegex(
                 trial._properties["source"], "Warm start.*Experiment.*trial"
+            )
+            self.assertEqual(
+                trial._properties["generation_model_key"], Models.SOBOL.value
             )
             self.assertDictEqual(trial.run_metadata, DUMMY_RUN_METADATA)
             i_old_trial += 1

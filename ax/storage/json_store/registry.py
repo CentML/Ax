@@ -72,14 +72,18 @@ from ax.metrics.jenatton import JenattonMetric
 from ax.metrics.l2norm import L2NormMetric
 from ax.metrics.noisy_function import NoisyFunctionMetric
 from ax.metrics.sklearn import SklearnDataset, SklearnMetric, SklearnModelType
+from ax.modelbridge.completion_criterion import (
+    MinimumPreferenceOccurances,
+    MinimumTrialsInStatus,
+)
 from ax.modelbridge.factory import Models
 from ax.modelbridge.generation_strategy import GenerationStep, GenerationStrategy
 from ax.modelbridge.transforms.base import Transform
-from ax.modelbridge.transforms.winsorize import WinsorizationConfig
 from ax.models.torch.botorch_modular.acquisition import Acquisition
 from ax.models.torch.botorch_modular.list_surrogate import ListSurrogate
 from ax.models.torch.botorch_modular.model import BoTorchModel
 from ax.models.torch.botorch_modular.surrogate import Surrogate
+from ax.models.winsorization_config import WinsorizationConfig
 from ax.runners.botorch_test_problem import BotorchTestProblemRunner
 from ax.runners.synthetic import SyntheticRunner
 from ax.service.utils.scheduler_options import SchedulerOptions, TrialType
@@ -91,6 +95,7 @@ from ax.storage.json_store.encoders import (
     botorch_model_to_dict,
     botorch_modular_to_dict,
     choice_parameter_to_dict,
+    completion_criterion_to_dict,
     data_to_dict,
     experiment_to_dict,
     fixed_parameter_to_dict,
@@ -167,6 +172,8 @@ CORE_ENCODER_REGISTRY: Dict[Type, Callable[[Any], Dict[str, Any]]] = {
     MapKeyInfo: map_key_info_to_dict,
     MapMetric: metric_to_dict,
     Metric: metric_to_dict,
+    MinimumTrialsInStatus: completion_criterion_to_dict,
+    MinimumPreferenceOccurances: completion_criterion_to_dict,
     MultiObjective: multi_objective_to_dict,
     MultiObjectiveOptimizationConfig: multi_objective_optimization_config_to_dict,
     MultiTypeExperiment: multi_type_experiment_to_dict,
@@ -263,6 +270,8 @@ CORE_DECODER_REGISTRY: Dict[str, Type] = {
     "MapMetric": MapMetric,
     "MapKeyInfo": MapKeyInfo,
     "Metric": Metric,
+    "MinimumTrialsInStatus": MinimumTrialsInStatus,
+    "MinimumPreferenceOccurances": MinimumPreferenceOccurances,
     "Models": Models,
     "MultiObjective": MultiObjective,
     "MultiObjectiveBenchmarkProblem": MultiObjectiveBenchmarkProblem,

@@ -38,6 +38,7 @@ from ax.modelbridge.cross_validation import cross_validate
 from ax.plot.contour import interact_contour_plotly
 from ax.plot.diagnostic import interact_cross_validation_plotly
 from ax.plot.feature_importances import plot_feature_importance_by_feature_plotly
+from ax.plot.helper import get_range_parameters_from_list
 from ax.plot.pareto_frontier import (
     _pareto_frontier_plot_input_processing,
     _validate_experiment_and_get_optimization_config,
@@ -142,7 +143,9 @@ def _get_objective_v_param_plots(
 ) -> List[go.Figure]:
     search_space = experiment.search_space
 
-    range_params = list(search_space.range_parameters.keys())
+    range_params = get_range_parameters_from_list(
+        list(search_space.range_parameters.values()), min_num_values=5
+    )
     if len(range_params) < 1:
         # if search space contains no range params
         logger.warning(
@@ -413,11 +416,16 @@ def _merge_trials_dict_with_df(
 
 
 def _get_generation_method_str(trial: BaseTrial) -> str:
+    trial_generation_property = trial._properties.get("generation_model_key")
+    if trial_generation_property is not None:
+        return trial_generation_property
+
     generation_methods = {
         not_none(generator_run._model_key)
         for generator_run in trial.generator_runs
         if generator_run._model_key is not None
     }
+
     # add "Manual" if any generator_runs are manual
     if any(
         generator_run.generator_run_type == GeneratorRunType.MANUAL.name

@@ -17,8 +17,9 @@ from ax.core.search_space import SearchSpace
 from ax.modelbridge.generation_strategy import GenerationStep, GenerationStrategy
 from ax.modelbridge.registry import Cont_X_trans, Models, Y_trans
 from ax.modelbridge.transforms.base import Transform
-from ax.modelbridge.transforms.winsorize import WinsorizationConfig, Winsorize
+from ax.modelbridge.transforms.winsorize import Winsorize
 from ax.models.types import TConfig
+from ax.models.winsorization_config import WinsorizationConfig
 from ax.utils.common.logger import get_logger
 from ax.utils.common.typeutils import not_none
 
@@ -62,7 +63,6 @@ def _make_sobol_step(
 
 def _make_botorch_step(
     num_trials: int = -1,
-    optimization_config: Optional[OptimizationConfig] = None,
     min_trials_observed: Optional[int] = None,
     enforce_num_trials: bool = True,
     max_parallelism: Optional[int] = None,
@@ -75,32 +75,35 @@ def _make_botorch_step(
     should_deduplicate: bool = False,
     verbose: Optional[bool] = None,
     disable_progbar: Optional[bool] = None,
+    derelativize_with_raw_status_quo: bool = False,
 ) -> GenerationStep:
     """Shortcut for creating a BayesOpt generation step."""
 
     winsorization_transform_config = _get_winsorization_transform_config(
         winsorization_config=winsorization_config,
-        optimization_config=optimization_config,
         no_winsorization=no_winsorization,
+        derelativize_with_raw_status_quo=derelativize_with_raw_status_quo,
     )
 
+    derelativization_transform_config = {
+        "use_raw_status_quo": derelativize_with_raw_status_quo
+    }
+
     model_kwargs = model_kwargs or {}
-    if winsorization_transform_config is not None:
-        model_kwargs.update(
-            {
-                "transforms": [cast(Type[Transform], Winsorize)]
-                + Cont_X_trans
-                + Y_trans,
-                "transform_configs": {"Winsorize": winsorization_transform_config},
+    if not no_winsorization:
+        transforms = [cast(Type[Transform], Winsorize)] + Cont_X_trans + Y_trans
+        model_kwargs.update({"transforms": transforms})
+        if winsorization_transform_config is not None:
+            transform_configs = {
+                "Winsorize": winsorization_transform_config,
+                "Derelativize": derelativization_transform_config,
             }
-        )
+            model_kwargs.update({"transform_configs": transform_configs})
+
     if verbose is not None:
         model_kwargs.update({"verbose": verbose})
     if disable_progbar is not None:
         model_kwargs.update({"disable_progbar": disable_progbar})
-    model_gen_kwargs = None
-    if is_saasbo(model):
-        model_gen_kwargs = {"optimizer_kwargs": {"init_batch_limit": 128}}
     return GenerationStep(
         model=model,
         num_trials=num_trials,
@@ -111,7 +114,6 @@ def _make_botorch_step(
         # `model_kwargs` should default to `None` if empty
         model_kwargs=model_kwargs if len(model_kwargs) > 0 else None,
         should_deduplicate=should_deduplicate,
-        model_gen_kwargs=model_gen_kwargs,
     )
 
 
@@ -218,8 +220,30 @@ def _suggest_gp_model(
     return None
 
 
+def calculate_num_initialization_trials(
+    num_tunable_parameters: int,
+    num_trials: Optional[int],
+    use_batch_trials: bool,
+) -> int:
+    """
+    Applies rules from high to low priority
+     - 1 for batch trials.
+     - At least 5
+     - At most 1/5th of num_trials.
+     - Twice the number of tunable parameters
+    """
+    if use_batch_trials:  # Batched trials.
+        return 1
+
+    ret = 2 * num_tunable_parameters
+    if num_trials is not None:
+        ret = min(ret, not_none(num_trials) // 5)
+    return max(ret, 5)
+
+
 def choose_generation_strategy(
     search_space: SearchSpace,
+    *,
     use_batch_trials: bool = False,
     enforce_sequential_optimization: bool = True,
     random_seed: Optional[int] = None,
@@ -228,9 +252,12 @@ def choose_generation_strategy(
     winsorization_config: Optional[
         Union[WinsorizationConfig, Dict[str, WinsorizationConfig]]
     ] = None,
+    derelativize_with_raw_status_quo: bool = False,
     no_bayesian_optimization: bool = False,
     num_trials: Optional[int] = None,
     num_initialization_trials: Optional[int] = None,
+    num_completed_initialization_trials: int = 0,
+    max_initialization_trials: Optional[int] = None,
     max_parallelism_cap: Optional[int] = None,
     max_parallelism_override: Optional[int] = None,
     optimization_config: Optional[OptimizationConfig] = None,
@@ -269,12 +296,24 @@ def choose_generation_strategy(
         winsorization_config: Explicit winsorization settings, if winsorizing. Usually
             only `upper_quantile_margin` is set when minimizing, and only
             `lower_quantile_margin` when maximizing.
+        derelativize_with_raw_status_quo: Whether to derelativize using the raw status
+            quo values in any transforms. This argument is primarily to allow automatic
+            Winsorization when relative constraints are present. Note: automatic
+            Winsorization will fail if this is set to `False` (or unset) and there
+            are relative constraints present.
         no_bayesian_optimization: If True, Bayesian optimization generation
             strategy will not be suggested and quasi-random strategy will be used.
         num_trials: Total number of trials in the optimization, if
             known in advance.
         num_initialization_trials: Specific number of initialization trials, if wanted.
             Typically, initialization trials are generated quasi-randomly.
+        max_initialization_trials: If ``num_initialization_trials`` unspecified, it
+            will be determined automatically. This arg provides a cap on that
+            automatically determined number.
+        num_completed_initialization_trials: The final calculated number of
+            initialization trials is reduced by this number. This is useful when
+            warm-starting an experiment, to specify what number of completed trials
+            can be used to satisfy the initialization_trial requirement.
         max_parallelism_cap: Integer cap on parallelism in this generation strategy.
             If specified, ``max_parallelism`` setting in each generation step will be
             set to the minimum of the default setting for that step and the value of
@@ -319,8 +358,11 @@ def choose_generation_strategy(
         experiment: If specified, ``_experiment`` attribute of the generation strategy
             will be set to this experiment (useful for associating a generation
             strategy with a given experiment before it's first used to ``gen`` with
-            that experiment).
+            that experiment). Can also provide `optimization_config` if it is not
+            provided as an arg to this function.
     """
+    if optimization_config is None and experiment is not None:
+        optimization_config = experiment.optimization_config
     suggested_model = _suggest_gp_model(
         search_space=search_space,
         num_trials=num_trials,
@@ -360,22 +402,36 @@ def choose_generation_strategy(
             )
 
         # If number of initialization trials is not specified, estimate it.
+        logger.info(
+            "Calculating the number of remaining initialization trials based on "
+            f"num_initialization_trials={num_initialization_trials} "
+            f"max_initialization_trials={max_initialization_trials} "
+            f"num_tunable_parameters={len(search_space.tunable_parameters)} "
+            f"num_trials={num_trials} "
+            f"use_batch_trials={use_batch_trials}"
+        )
         if num_initialization_trials is None:
-            if use_batch_trials:  # Batched trials.
-                num_initialization_trials = 1
-            elif num_trials is not None:  # 1-arm trials with specified `num_trials`.
-                num_initialization_trials = max(
-                    5,
-                    min(
-                        not_none(num_trials) // 5,
-                        2 * len(search_space.tunable_parameters),
-                    ),
-                )
-            else:  # 1-arm trials.
-                num_initialization_trials = max(
-                    5, 2 * len(search_space.tunable_parameters)
-                )
-
+            num_initialization_trials = calculate_num_initialization_trials(
+                num_tunable_parameters=len(search_space.tunable_parameters),
+                num_trials=num_trials,
+                use_batch_trials=use_batch_trials,
+            )
+            logger.info(
+                f"calculated num_initialization_trials={num_initialization_trials}"
+            )
+        if max_initialization_trials is not None:
+            num_initialization_trials = min(
+                num_initialization_trials, max_initialization_trials
+            )
+        num_remaining_initialization_trials = max(
+            0, num_initialization_trials - max(0, num_completed_initialization_trials)
+        )
+        logger.info(
+            "num_completed_initialization_trials="
+            f"{num_completed_initialization_trials} "
+            f"num_remaining_initialization_trials={num_remaining_initialization_trials}"
+        )
+        steps = []
         # `verbose` and `disable_progbar` defaults and overrides
         model_is_saasbo = is_saasbo(suggested_model)
         if verbose is None and model_is_saasbo:
@@ -393,12 +449,11 @@ def choose_generation_strategy(
             disable_progbar = None
 
         # Create `generation_strategy`, adding first Sobol step
-        # if `num_initialization_trials` is > 0.
-        steps = []
-        if num_initialization_trials is None or num_initialization_trials > 0:
+        # if `num_remaining_initialization_trials` is > 0.
+        if num_remaining_initialization_trials > 0:
             steps.append(
                 _make_sobol_step(
-                    num_trials=num_initialization_trials,
+                    num_trials=num_remaining_initialization_trials,
                     enforce_num_trials=enforce_sequential_optimization,
                     seed=random_seed,
                     max_parallelism=sobol_parallelism,
@@ -408,8 +463,8 @@ def choose_generation_strategy(
         steps.append(
             _make_botorch_step(
                 model=suggested_model,
-                optimization_config=optimization_config,
                 winsorization_config=winsorization_config,
+                derelativize_with_raw_status_quo=derelativize_with_raw_status_quo,
                 no_winsorization=no_winsorization,
                 max_parallelism=bo_parallelism,
                 model_kwargs={"torch_device": torch_device},
@@ -421,8 +476,8 @@ def choose_generation_strategy(
         gs = GenerationStrategy(steps=steps)
         logger.info(
             f"Using Bayesian Optimization generation strategy: {gs}. Iterations after"
-            f" {num_initialization_trials} will take longer to generate due to "
-            " model-fitting."
+            f" {num_remaining_initialization_trials} will take longer to generate due"
+            " to model-fitting."
         )
     else:  # `no_bayesian_optimization` is True or we could not suggest BO model
         if verbose is not None:
@@ -450,22 +505,19 @@ def _get_winsorization_transform_config(
     winsorization_config: Optional[
         Union[WinsorizationConfig, Dict[str, WinsorizationConfig]]
     ],
-    optimization_config: Optional[OptimizationConfig],
+    derelativize_with_raw_status_quo: bool,
     no_winsorization: bool,
 ) -> Optional[TConfig]:
-    if no_winsorization or not (winsorization_config or optimization_config):
+    if no_winsorization:
         if winsorization_config is not None:
             warnings.warn(
                 "`no_winsorization = True` but `winsorization_config` has been set. "
                 "Not winsorizing."
             )
         return None
-    transform_config = {}
     if winsorization_config:
-        transform_config["winsorization_config"] = winsorization_config
-    if optimization_config:
-        transform_config["optimization_config"] = optimization_config
-    return transform_config
+        return {"winsorization_config": winsorization_config}
+    return {"derelativize_with_raw_status_quo": derelativize_with_raw_status_quo}
 
 
 def is_saasbo(model: Models) -> bool:
